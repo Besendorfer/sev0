@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import time
 import uuid
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
@@ -15,6 +19,11 @@ from sev0.models import AlertEvent, TriageResult
 from sev0.registry import register_channel
 
 logger = logging.getLogger(__name__)
+
+MAX_CONTENT_LENGTH = 1 * 1024 * 1024  # 1 MB
+MAX_MESSAGE_LENGTH = 50_000
+RATE_LIMIT_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 _SEVERITY_COLORS = {
     "critical": "attention",
@@ -92,11 +101,14 @@ class TeamsChannel(AbstractChannel):
         self,
         webhook_url: str,
         listen_port: int = 8089,
+        webhook_secret: str = "",
         **kwargs: Any,
     ):
         self._webhook_url = webhook_url
         self._listen_port = listen_port
+        self._webhook_secret = webhook_secret
         self._alert_queue: asyncio.Queue[AlertEvent] = asyncio.Queue()
+        self._request_times: dict[str, deque[float]] = {}
 
     async def notify(self, result: TriageResult) -> None:
         card = _build_adaptive_card(result)
@@ -128,8 +140,49 @@ class TeamsChannel(AbstractChannel):
                 event = await self._alert_queue.get()
                 yield event
 
+    def _is_rate_limited(self, peer_ip: str) -> bool:
+        now = time.time()
+        if peer_ip not in self._request_times:
+            self._request_times[peer_ip] = deque(maxlen=RATE_LIMIT_REQUESTS)
+
+        dq = self._request_times[peer_ip]
+        # Evict expired entries from the front
+        while dq and now - dq[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            dq.popleft()
+
+        if len(dq) >= RATE_LIMIT_REQUESTS:
+            return True
+        dq.append(now)
+
+        # Lazy cleanup: drop stale IPs periodically
+        if len(self._request_times) > 10_000:
+            stale = [ip for ip, d in self._request_times.items() if not d or now - d[-1] >= RATE_LIMIT_WINDOW_SECONDS]
+            for ip in stale:
+                del self._request_times[ip]
+
+        return False
+
+    def _verify_signature(self, body: bytes, signature: str) -> bool:
+        expected = hmac.new(
+            self._webhook_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected)
+
+    async def _send_response(self, writer: asyncio.StreamWriter, status: bytes) -> None:
+        writer.write(status + b"\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
+            peer = writer.get_extra_info("peername")
+            peer_ip = peer[0] if peer else "unknown"
+
+            # Rate limiting
+            if self._is_rate_limited(peer_ip):
+                logger.warning("Rate limit exceeded for %s", peer_ip)
+                await self._send_response(writer, b"HTTP/1.1 429 Too Many Requests")
+                return
+
             # Read HTTP request
             request_line = await reader.readline()
             headers = {}
@@ -140,8 +193,27 @@ class TeamsChannel(AbstractChannel):
                 key, _, value = line.decode().partition(":")
                 headers[key.strip().lower()] = value.strip()
 
-            content_length = int(headers.get("content-length", "0"))
+            # Enforce max content length
+            try:
+                content_length = int(headers.get("content-length", "0"))
+            except ValueError:
+                await self._send_response(writer, b"HTTP/1.1 400 Bad Request")
+                return
+
+            if content_length > MAX_CONTENT_LENGTH:
+                logger.warning("Content-Length %d exceeds limit from %s", content_length, peer_ip)
+                await self._send_response(writer, b"HTTP/1.1 413 Payload Too Large")
+                return
+
             body = await reader.readexactly(content_length) if content_length else b""
+
+            # Verify webhook signature if a secret is configured
+            if self._webhook_secret:
+                signature = headers.get("x-webhook-signature", "")
+                if not self._verify_signature(body, signature):
+                    logger.warning("Invalid webhook signature from %s", peer_ip)
+                    await self._send_response(writer, b"HTTP/1.1 401 Unauthorized")
+                    return
 
             # Parse and enqueue
             if body:
@@ -150,10 +222,7 @@ class TeamsChannel(AbstractChannel):
                 if event:
                     await self._alert_queue.put(event)
 
-            # Send 200 OK
-            response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-            writer.write(response)
-            await writer.drain()
+            await self._send_response(writer, b"HTTP/1.1 200 OK")
         except Exception as e:
             logger.error("Error handling Teams webhook: %s", e)
         finally:
@@ -166,8 +235,13 @@ class TeamsChannel(AbstractChannel):
         alert or a pasted log snippet.
         """
         text = data.get("text", "") or data.get("body", {}).get("content", "")
-        if not text:
+        if not text or not isinstance(text, str):
             return None
+
+        # Enforce message length limit
+        if len(text) > MAX_MESSAGE_LENGTH:
+            logger.warning("Teams message truncated from %d to %d chars", len(text), MAX_MESSAGE_LENGTH)
+            text = text[:MAX_MESSAGE_LENGTH]
 
         return AlertEvent(
             id=f"teams-{uuid.uuid4().hex[:12]}",

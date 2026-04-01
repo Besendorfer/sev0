@@ -5,7 +5,14 @@ dist/
 build/
 .venv/
 .env
+.env.*
+!.env.example
+config.yaml
 *.db
 data/
 .pytest_cache/
 .mypy_cache/
+*.key
+*.pem
+.DS_Store
+.claude/
