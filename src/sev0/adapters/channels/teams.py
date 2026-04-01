@@ -7,15 +7,16 @@ import json
 import logging
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
 
 import httpx
+from aiohttp import web
 
 from sev0.adapters.channels.base import AbstractChannel
-from sev0.models import AlertEvent, TriageResult
+from sev0.models import AlertEvent, Severity, TriageResult
 from sev0.registry import register_channel
 
 logger = logging.getLogger(__name__)
@@ -25,19 +26,25 @@ MAX_MESSAGE_LENGTH = 50_000
 RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW_SECONDS = 60
 
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
+}
+
 _SEVERITY_COLORS = {
-    "critical": "attention",
-    "high": "warning",
-    "medium": "accent",
-    "low": "good",
-    "info": "default",
+    Severity.CRITICAL: "attention",
+    Severity.HIGH: "warning",
+    Severity.MEDIUM: "accent",
+    Severity.LOW: "good",
+    Severity.INFO: "default",
 }
 
 
 def _build_adaptive_card(result: TriageResult) -> dict:
     """Build a Teams Adaptive Card from a triage result."""
-    severity = result.severity.value
-    color = _SEVERITY_COLORS.get(severity, "default")
+    color = _SEVERITY_COLORS.get(result.severity, "default")
+    icon = "🚨" if result.severity in (Severity.CRITICAL, Severity.HIGH) else "ℹ️"
 
     card = {
         "type": "message",
@@ -55,7 +62,7 @@ def _build_adaptive_card(result: TriageResult) -> dict:
                             "items": [
                                 {
                                     "type": "TextBlock",
-                                    "text": f"{'🚨' if severity in ('critical', 'high') else 'ℹ️'} [{severity.upper()}] {result.ticket_title}",
+                                    "text": f"{icon} [{result.severity.value.upper()}] {result.ticket_title}",
                                     "weight": "bolder",
                                     "size": "medium",
                                     "wrap": True,
@@ -71,7 +78,7 @@ def _build_adaptive_card(result: TriageResult) -> dict:
                             "type": "FactSet",
                             "facts": [
                                 {"title": "Service", "value": result.event.service},
-                                {"title": "Severity", "value": f"{severity} (confidence: {result.confidence:.0%})"},
+                                {"title": "Severity", "value": f"{result.severity.value} (confidence: {result.confidence:.0%})"},
                                 {"title": "Root Cause", "value": result.root_cause[:200]},
                                 {"title": "Action", "value": result.recommended_action[:200]},
                             ],
@@ -109,36 +116,46 @@ class TeamsChannel(AbstractChannel):
         self._webhook_secret = webhook_secret
         self._alert_queue: asyncio.Queue[AlertEvent] = asyncio.Queue()
         self._request_times: dict[str, deque[float]] = {}
+        self._client: httpx.AsyncClient | None = None
 
-    async def notify(self, result: TriageResult) -> None:
-        card = _build_adaptive_card(result)
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                self._webhook_url,
-                json=card,
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
                 headers={"Content-Type": "application/json"},
                 timeout=30,
             )
-            if resp.status_code not in (200, 202):
-                logger.error("Teams webhook failed (HTTP %d): %s", resp.status_code, resp.text[:200])
-            else:
-                logger.info("Notified Teams for: %s", result.ticket_title)
+        return self._client
+
+    async def notify(self, result: TriageResult) -> None:
+        card = _build_adaptive_card(result)
+        client = await self._get_client()
+        resp = await client.post(self._webhook_url, json=card)
+        if resp.status_code not in (200, 202):
+            logger.error("Teams webhook failed (HTTP %d): %s", resp.status_code, resp.text[:200])
+        else:
+            logger.info("Notified Teams for: %s", result.ticket_title)
 
     async def listen(self) -> AsyncIterator[AlertEvent]:
         """Listen for alerts forwarded via Teams incoming messages.
 
-        This starts a lightweight HTTP server that receives webhook payloads
+        Starts an aiohttp web server that receives webhook payloads
         from a Teams Outgoing Webhook or Power Automate flow.
         """
-        server = await asyncio.start_server(
-            self._handle_connection, "0.0.0.0", self._listen_port
-        )
+        app = web.Application(client_max_size=MAX_CONTENT_LENGTH)
+        app.router.add_post("/", self._handle_webhook)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._listen_port)
+        await site.start()
         logger.info("Teams listener started on port %d", self._listen_port)
 
-        async with server:
+        try:
             while True:
                 event = await self._alert_queue.get()
                 yield event
+        finally:
+            await runner.cleanup()
 
     def _is_rate_limited(self, peer_ip: str) -> bool:
         now = time.time()
@@ -168,70 +185,38 @@ class TeamsChannel(AbstractChannel):
         ).hexdigest()
         return hmac.compare_digest(signature, expected)
 
-    async def _send_response(self, writer: asyncio.StreamWriter, status: bytes) -> None:
-        writer.write(status + b"\r\nContent-Length: 0\r\n\r\n")
-        await writer.drain()
+    async def _handle_webhook(self, request: web.Request) -> web.Response:
+        peer = request.remote or "unknown"
 
-    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            peer = writer.get_extra_info("peername")
-            peer_ip = peer[0] if peer else "unknown"
+        # Rate limiting
+        if self._is_rate_limited(peer):
+            logger.warning("Rate limit exceeded for %s", peer)
+            return web.Response(status=429, text="Too Many Requests", headers=_SECURITY_HEADERS)
 
-            # Rate limiting
-            if self._is_rate_limited(peer_ip):
-                logger.warning("Rate limit exceeded for %s", peer_ip)
-                await self._send_response(writer, b"HTTP/1.1 429 Too Many Requests")
-                return
+        # Verify webhook signature if a secret is configured
+        body = await request.read()
+        if self._webhook_secret:
+            signature = request.headers.get("X-Webhook-Signature", "")
+            if not self._verify_signature(body, signature):
+                logger.warning("Invalid webhook signature from %s", peer)
+                return web.Response(status=401, text="Unauthorized", headers=_SECURITY_HEADERS)
 
-            # Read HTTP request
-            request_line = await reader.readline()
-            headers = {}
-            while True:
-                line = await reader.readline()
-                if line in (b"\r\n", b"\n", b""):
-                    break
-                key, _, value = line.decode().partition(":")
-                headers[key.strip().lower()] = value.strip()
-
-            # Enforce max content length
+        # Parse and enqueue
+        if body:
             try:
-                content_length = int(headers.get("content-length", "0"))
-            except ValueError:
-                await self._send_response(writer, b"HTTP/1.1 400 Bad Request")
-                return
-
-            if content_length > MAX_CONTENT_LENGTH:
-                logger.warning("Content-Length %d exceeds limit from %s", content_length, peer_ip)
-                await self._send_response(writer, b"HTTP/1.1 413 Payload Too Large")
-                return
-
-            body = await reader.readexactly(content_length) if content_length else b""
-
-            # Verify webhook signature if a secret is configured
-            if self._webhook_secret:
-                signature = headers.get("x-webhook-signature", "")
-                if not self._verify_signature(body, signature):
-                    logger.warning("Invalid webhook signature from %s", peer_ip)
-                    await self._send_response(writer, b"HTTP/1.1 401 Unauthorized")
-                    return
-
-            # Parse and enqueue
-            if body:
                 data = json.loads(body)
-                event = self._parse_teams_message(data)
-                if event:
-                    await self._alert_queue.put(event)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return web.Response(status=400, text="Bad Request", headers=_SECURITY_HEADERS)
+            event = self._parse_teams_message(data)
+            if event:
+                await self._alert_queue.put(event)
 
-            await self._send_response(writer, b"HTTP/1.1 200 OK")
-        except Exception as e:
-            logger.error("Error handling Teams webhook: %s", e)
-        finally:
-            writer.close()
+        return web.Response(status=200, text="OK", headers=_SECURITY_HEADERS)
 
     def _parse_teams_message(self, data: dict) -> AlertEvent | None:
         """Parse a Teams message payload into an AlertEvent.
 
-        Expects the message text to contain error details — either as a forwarded
+        Expects the message text to contain error details -- either as a forwarded
         alert or a pasted log snippet.
         """
         text = data.get("text", "") or data.get("body", {}).get("content", "")
