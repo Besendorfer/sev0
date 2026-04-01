@@ -1,0 +1,36 @@
+sources:
+  - type: cloudwatch
+    region: us-east-1
+    log_groups:
+      - /aws/lambda/my-api
+      - /ecs/my-service
+    query: "fields @timestamp, @message | filter @message like /ERROR|Exception/ | sort @timestamp desc | limit 100"
+    lookback_minutes: 480
+
+channels:
+  - type: teams
+    webhook_url: ${TEAMS_WEBHOOK_URL}
+    listen_port: 8089
+
+actions:
+  - type: jira
+    base_url: ${JIRA_BASE_URL}
+    email: ${JIRA_EMAIL}
+    api_token: ${JIRA_API_TOKEN}
+    project_key: OPS
+    issue_type: Bug
+    default_labels:
+      - auto-triage
+
+triage:
+  model: claude-sonnet-4-6
+  severity_threshold: medium
+  max_events_per_sweep: 50
+
+dedup:
+  db_path: ./data/dedup.db
+  ttl_hours: 72
+
+schedule:
+  - cron: "0 8 * * *"     # 8 AM daily sweep
+  - cron: "0 17 * * *"    # 5 PM daily sweep
