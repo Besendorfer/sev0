@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -10,6 +11,16 @@ from sev0.models import ActionResult, TriageResult
 from sev0.registry import register_action
 
 logger = logging.getLogger(__name__)
+
+_ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+
+_SEVERITY_TO_JIRA_PRIORITY = {
+    "critical": "Highest",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "info": "Lowest",
+}
 
 
 def _markdown_to_adf(markdown: str) -> dict:
@@ -116,10 +127,6 @@ class JiraAction(AbstractAction):
             }
         }
 
-        if result.suggested_owner:
-            # Store as a comment rather than assigning — we don't know Jira user IDs
-            pass
-
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
@@ -150,12 +157,11 @@ class JiraAction(AbstractAction):
                         resource_id=issue_key,
                     )
                 else:
-                    error = resp.text[:500]
-                    logger.error("Jira create failed (HTTP %d): %s", resp.status_code, error)
+                    logger.error("Jira create failed (HTTP %d)", resp.status_code)
                     return ActionResult(
                         action_type="jira",
                         success=False,
-                        error=f"HTTP {resp.status_code}: {error}",
+                        error=f"HTTP {resp.status_code}",
                     )
 
         except Exception as e:
@@ -163,6 +169,9 @@ class JiraAction(AbstractAction):
             return ActionResult(action_type="jira", success=False, error=str(e))
 
     async def _add_comment(self, client: httpx.AsyncClient, issue_key: str, text: str) -> None:
+        if not _ISSUE_KEY_RE.match(issue_key):
+            logger.error("Invalid issue key format: %s", issue_key)
+            return
         try:
             await client.post(
                 f"{self._base_url}/rest/api/3/issue/{issue_key}/comment",
@@ -176,10 +185,4 @@ class JiraAction(AbstractAction):
 
     @staticmethod
     def _severity_to_jira_priority(severity: str) -> str:
-        return {
-            "critical": "Highest",
-            "high": "High",
-            "medium": "Medium",
-            "low": "Low",
-            "info": "Lowest",
-        }.get(severity, "Medium")
+        return _SEVERITY_TO_JIRA_PRIORITY.get(severity, "Medium")

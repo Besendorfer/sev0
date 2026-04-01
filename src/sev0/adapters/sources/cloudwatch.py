@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -33,16 +34,20 @@ class CloudWatchSource(AbstractSource):
 
     async def fetch_alerts(self, since: datetime) -> list[AlertEvent]:
         loop = asyncio.get_event_loop()
-        events: list[AlertEvent] = []
 
-        for log_group in self._log_groups:
-            try:
-                group_events = await loop.run_in_executor(
-                    None, self._query_log_group, log_group, since
-                )
-                events.extend(group_events)
-            except Exception as e:
-                logger.error("Failed to query log group %s: %s", log_group, e)
+        # Query all log groups concurrently
+        tasks = [
+            loop.run_in_executor(None, self._query_log_group, log_group, since)
+            for log_group in self._log_groups
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        events: list[AlertEvent] = []
+        for log_group, result in zip(self._log_groups, results):
+            if isinstance(result, Exception):
+                logger.error("Failed to query log group %s: %s", log_group, result)
+            else:
+                events.extend(result)
 
         logger.info("Fetched %d alerts from CloudWatch across %d log groups", len(events), len(self._log_groups))
         return events
@@ -65,7 +70,6 @@ class CloudWatchSource(AbstractSource):
             status = result["status"]
             if status in ("Complete", "Failed", "Cancelled", "Timeout"):
                 break
-            import time
             time.sleep(0.5)
 
         if status != "Complete":
@@ -74,7 +78,12 @@ class CloudWatchSource(AbstractSource):
 
         events = []
         for row in result.get("results", []):
-            fields = {f["field"]: f["value"] for f in row}
+            try:
+                fields = {f["field"]: f["value"] for f in row}
+            except (KeyError, TypeError):
+                logger.warning("Malformed CloudWatch result row, skipping")
+                continue
+
             timestamp_str = fields.get("@timestamp", "")
             message = fields.get("@message", "")
 
@@ -82,7 +91,7 @@ class CloudWatchSource(AbstractSource):
                 continue
 
             # Extract service name from log group path
-            service = log_group.rsplit("/", 1)[-1]
+            service = log_group.rsplit("/", 1)[-1] or "unknown"
 
             # Try to extract a meaningful title from the first line
             first_line = message.split("\n", 1)[0][:200]
