@@ -11,38 +11,38 @@ Sev0 handles the first 80% of incident response automatically. It pulls errors f
 ## How it works
 
 ```
-  Scheduled sweep               Reactive alert
+  Scheduled sweep                Reactive alert
   (cron: 8am, 5pm)              (Teams/Slack message)
-        |                              |
-        v                              v
-  ┌──────────┐                  ┌──────────┐
-  │ CloudWatch│                  │  Teams   │
-  │  Datadog  │                  │  Slack   │
-  │  Splunk   │                  │  Email   │
-  └─────┬─────┘                  └─────┬────┘
-        │                              │
-        └──────────┬───────────────────┘
+        |                               |
+        v                               v
+  ┌────────────┐                 ┌────────────┐
+  │ CloudWatch │                 │   Teams    │
+  │  Datadog   │                 │   Slack    │
+  │  Splunk    │                 │   Email    │
+  └──────┬─────┘                 └──────┬─────┘
+         │                              │
+         └──────────┬───────────────────┘
+                    v
+            ┌──────────────┐
+            │  Normalize   │  Common event format
+            └──────┬───────┘
                    v
-           ┌──────────────┐
-           │  Normalize   │  Common event format
-           └──────┬───────┘
-                  v
-           ┌──────────────┐
-           │   Dedup      │  Skip if already triaged
-           └──────┬───────┘
-                  v
-           ┌──────────────┐
-           │  AI Triage   │  Severity, root cause,
-           │   (Claude)   │  suggested owner, action
-           └──────┬───────┘
-                  v
-        ┌─────────┴──────────┐
-        v                    v
-  ┌──────────┐        ┌──────────┐
-  │  Create  │        │  Notify  │
-  │  Ticket  │        │  Team    │
-  │ (Jira)   │        │ (Teams)  │
-  └──────────┘        └──────────┘
+            ┌──────────────┐
+            │    Dedup     │  Skip if already triaged
+            └──────┬───────┘
+                   v
+            ┌──────────────┐
+            │  AI Triage   │  Severity, root cause,
+            │   (Claude)   │  suggested owner, action
+            └──────┬───────┘
+                   v
+         ┌─────────┴──────────┐
+         v                    v
+   ┌──────────┐        ┌──────────┐
+   │  Create  │        │  Notify  │
+   │  Ticket  │        │  Team    │
+   │  (Jira)  │        │ (Teams)  │
+   └──────────┘        └──────────┘
 ```
 
 **Two flows, one pipeline:**
