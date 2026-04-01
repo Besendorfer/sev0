@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 
 from sev0.adapters.actions.base import AbstractAction
-from sev0.models import ActionResult, TriageResult
+from sev0.models import ActionResult, Severity, TriageResult
 from sev0.registry import register_action
 
 logger = logging.getLogger(__name__)
@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 
 _SEVERITY_TO_JIRA_PRIORITY = {
-    "critical": "Highest",
-    "high": "High",
-    "medium": "Medium",
-    "low": "Low",
-    "info": "Lowest",
+    Severity.CRITICAL: "Highest",
+    Severity.HIGH: "High",
+    Severity.MEDIUM: "Medium",
+    Severity.LOW: "Low",
+    Severity.INFO: "Lowest",
 }
 
 
@@ -111,6 +111,20 @@ class JiraAction(AbstractAction):
         self._issue_type = issue_type
         self._default_labels = default_labels or ["auto-triage"]
         self._auth = (email, api_token)
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                auth=self._auth,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
 
     async def execute(self, result: TriageResult) -> ActionResult:
         payload = {
@@ -123,66 +137,61 @@ class JiraAction(AbstractAction):
                     f"severity-{result.severity.value}",
                     f"service-{result.event.service}",
                 ],
-                "priority": {"name": self._severity_to_jira_priority(result.severity.value)},
+                "priority": {"name": self._severity_to_jira_priority(result.severity)},
             }
         }
 
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self._base_url}/rest/api/3/issue",
-                    json=payload,
-                    auth=self._auth,
-                    headers={"Content-Type": "application/json"},
-                    timeout=30,
+            client = await self._get_client()
+            resp = await client.post(
+                f"{self._base_url}/rest/api/3/issue",
+                json=payload,
+            )
+
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                issue_key = data["key"]
+                url = f"{self._base_url}/browse/{issue_key}"
+                logger.info("Created Jira issue: %s", issue_key)
+
+                if result.suggested_owner:
+                    await self._add_comment(
+                        issue_key,
+                        f"AI triage suggests this should be owned by: {result.suggested_owner}"
+                    )
+
+                return ActionResult(
+                    action_type="jira",
+                    success=True,
+                    url=url,
+                    resource_id=issue_key,
                 )
-
-                if resp.status_code in (200, 201):
-                    data = resp.json()
-                    issue_key = data["key"]
-                    url = f"{self._base_url}/browse/{issue_key}"
-                    logger.info("Created Jira issue: %s", issue_key)
-
-                    # Add a comment with suggested owner if present
-                    if result.suggested_owner:
-                        await self._add_comment(
-                            client, issue_key,
-                            f"AI triage suggests this should be owned by: {result.suggested_owner}"
-                        )
-
-                    return ActionResult(
-                        action_type="jira",
-                        success=True,
-                        url=url,
-                        resource_id=issue_key,
-                    )
-                else:
-                    logger.error("Jira create failed (HTTP %d)", resp.status_code)
-                    return ActionResult(
-                        action_type="jira",
-                        success=False,
-                        error=f"HTTP {resp.status_code}",
-                    )
+            else:
+                logger.error("Jira create failed (HTTP %d)", resp.status_code)
+                return ActionResult(
+                    action_type="jira",
+                    success=False,
+                    error=f"HTTP {resp.status_code}",
+                )
 
         except Exception as e:
             logger.error("Jira request failed: %s", e)
             return ActionResult(action_type="jira", success=False, error=str(e))
 
-    async def _add_comment(self, client: httpx.AsyncClient, issue_key: str, text: str) -> None:
+    async def _add_comment(self, issue_key: str, text: str) -> None:
         if not _ISSUE_KEY_RE.match(issue_key):
             logger.error("Invalid issue key format: %s", issue_key)
             return
         try:
+            client = await self._get_client()
             await client.post(
                 f"{self._base_url}/rest/api/3/issue/{issue_key}/comment",
                 json={"body": _markdown_to_adf(text)},
-                auth=self._auth,
-                headers={"Content-Type": "application/json"},
                 timeout=15,
             )
         except Exception as e:
             logger.warning("Failed to add comment to %s: %s", issue_key, e)
 
     @staticmethod
-    def _severity_to_jira_priority(severity: str) -> str:
+    def _severity_to_jira_priority(severity: Severity) -> str:
         return _SEVERITY_TO_JIRA_PRIORITY.get(severity, "Medium")

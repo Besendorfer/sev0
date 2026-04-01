@@ -66,6 +66,8 @@ class Engine:
                      len(self._sources), len(self._channels), len(self._actions))
 
     async def shutdown(self) -> None:
+        for action in self._actions:
+            await action.close()
         if self._dedup:
             await self._dedup.close()
 
@@ -150,6 +152,11 @@ class Engine:
             for action in self._actions:
                 action_result = await action.execute(result)
                 result.action_results.append(action_result)
+                logger.info(
+                    "AUDIT action_executed type=%s success=%s resource_id=%s event=%s severity=%s",
+                    action_result.action_type, action_result.success,
+                    action_result.resource_id or "n/a", event.fingerprint, result.severity.value,
+                )
                 if action_result.success and action_result.url:
                     await self._dedup.record_ticket(event.fingerprint, action_result.url)
 
