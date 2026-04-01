@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+import os
 import time
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_alerts (
@@ -24,7 +28,11 @@ class DedupStore:
 
     async def initialize(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
+        old_umask = os.umask(0o077)
+        try:
+            self._db = await aiosqlite.connect(self._db_path)
+        finally:
+            os.umask(old_umask)
         await self._db.execute(_SCHEMA)
         await self._db.commit()
 
@@ -48,11 +56,13 @@ class DedupStore:
             last_seen, count = row
             if last_seen >= cutoff:
                 # Still within TTL window — update and mark as duplicate
+                new_count = count + 1
                 await self._db.execute(
                     "UPDATE seen_alerts SET last_seen = ?, count = ? WHERE fingerprint = ?",
-                    (now, count + 1, fingerprint),
+                    (now, new_count, fingerprint),
                 )
                 await self._db.commit()
+                logger.info("AUDIT dedup_suppressed fingerprint=%s count=%d", fingerprint, new_count)
                 return True
             else:
                 # Expired — treat as new, reset
@@ -61,6 +71,7 @@ class DedupStore:
                     (now, now, fingerprint),
                 )
                 await self._db.commit()
+                logger.info("AUDIT dedup_expired_reset fingerprint=%s previous_count=%d", fingerprint, count)
                 return False
 
         # Never seen — insert

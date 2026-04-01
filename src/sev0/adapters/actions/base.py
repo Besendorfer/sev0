@@ -10,3 +10,6 @@ class AbstractAction(ABC):
     async def execute(self, result: TriageResult) -> ActionResult:
         """Take action on a triage result (e.g., create a ticket). Returns result with URL/ID."""
         ...
+
+    async def close(self) -> None:
+        """Release resources held by this action. Called during engine shutdown."""
